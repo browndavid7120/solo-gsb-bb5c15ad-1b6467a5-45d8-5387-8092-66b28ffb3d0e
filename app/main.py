@@ -10,6 +10,11 @@
   宽度（东亚全角/宽字符 2 格，其余 1 格）为每段做全局最优断行，保留原时码
   与文字，返回各行文字与断行字符偏移；无法排版或片段时长非正时返回 422
   并指出字幕下标。
+- ``POST /edits/project``：接收源字幕片段与按成片顺序排列的剪辑（源区间允许
+  重叠、重排、重复使用），按半开区间求每条字幕与每段剪辑的交集，按
+  duration 与源区间长度之比线性映射两端点到剪辑后的成片时间轴，四舍五入到
+  毫秒并丢弃零时长结果；返回可直接送入 ``/layout/wrap`` 的片段与未产生输出
+  的字幕下标。
 """
 from __future__ import annotations
 
@@ -139,6 +144,48 @@ class WrappedSegment(BaseModel):
 
 class WrapResponse(BaseModel):
     segments: List[WrappedSegment]
+
+
+class ProjectSegment(BaseModel):
+    """一条以源素材毫秒计时的字幕片段。"""
+
+    start: int = Field(..., description="片段源起始时间（毫秒）")
+    end: int = Field(..., description="片段源结束时间（毫秒，半开区间）")
+    text: str = Field("", description="字幕文字，原样保留")
+
+
+class ProjectClip(BaseModel):
+    """一段剪辑：把源素材 [source_start, source_end) 压放到成片轴上 duration 毫秒。"""
+
+    source_start: int = Field(..., description="源区间起始时间（毫秒）")
+    source_end: int = Field(..., description="源区间结束时间（毫秒，半开区间）")
+    duration: int = Field(..., description="该段在成片时间轴上的时长（毫秒，正整数）")
+
+
+class EditProjectRequest(BaseModel):
+    segments: List[ProjectSegment] = Field(..., description="待投影的源字幕片段")
+    clips: List[ProjectClip] = Field(
+        ..., description="按成片顺序排列的剪辑；源区间允许重叠、重排、重复使用"
+    )
+
+
+class ProjectedSegment(BaseModel):
+    """一条字幕落在某段剪辑上、投影到成片时间轴后的片段。"""
+
+    segment_index: int = Field(..., description="来源字幕下标（从 0 开始）")
+    clip_index: int = Field(..., description="来源剪辑下标（从 0 开始）")
+    start: int = Field(..., description="投影后起始时间（毫秒，整数）")
+    end: int = Field(..., description="投影后结束时间（毫秒，整数）")
+    text: str = Field("", description="原字幕文字")
+
+
+class EditProjectResponse(BaseModel):
+    segments: List[ProjectedSegment] = Field(
+        ..., description="投影结果，start/end/text 可直接送入 /layout/wrap"
+    )
+    unused_segment_indices: List[int] = Field(
+        ..., description="未产生任何输出片段的字幕下标（从 0 开始，升序）"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -680,6 +727,167 @@ def layout_wrap(req: WrapRequest) -> tuple[Optional[WrapResponse], List[ErrorIte
 
 
 # --------------------------------------------------------------------------- #
+# 剪辑时间轴投影逻辑
+# --------------------------------------------------------------------------- #
+def validate_project_inputs(
+    segments: List[ProjectSegment], clips: List[ProjectClip]
+) -> List[ErrorItem]:
+    """校验字幕与剪辑：列表非空、起点非负、时长为正；所有错误一次性收集。"""
+    errors: List[ErrorItem] = []
+
+    if not segments:
+        errors.append(
+            ErrorItem(
+                location="segments",
+                index=None,
+                code="empty",
+                message="segments 不能为空",
+            )
+        )
+    for idx, seg in enumerate(segments):
+        if seg.start < 0:
+            errors.append(
+                ErrorItem(
+                    location="segment.start",
+                    index=idx,
+                    code="negative_time",
+                    message=f"第 {idx} 条字幕 start 为负：{seg.start}",
+                )
+            )
+        if seg.end < 0:
+            errors.append(
+                ErrorItem(
+                    location="segment.end",
+                    index=idx,
+                    code="negative_time",
+                    message=f"第 {idx} 条字幕 end 为负：{seg.end}",
+                )
+            )
+        if seg.end <= seg.start:
+            errors.append(
+                ErrorItem(
+                    location="segment",
+                    index=idx,
+                    code="non_positive_duration",
+                    message=(
+                        f"第 {idx} 条字幕时长非正：start={seg.start}，end={seg.end}，"
+                        "要求 end > start"
+                    ),
+                )
+            )
+
+    if not clips:
+        errors.append(
+            ErrorItem(
+                location="clips",
+                index=None,
+                code="empty",
+                message="clips 不能为空",
+            )
+        )
+    for idx, clip in enumerate(clips):
+        if clip.source_start < 0:
+            errors.append(
+                ErrorItem(
+                    location="clip.source_start",
+                    index=idx,
+                    code="negative_time",
+                    message=(
+                        f"第 {idx} 段剪辑 source_start 为负：{clip.source_start}"
+                    ),
+                )
+            )
+        if clip.source_end < 0:
+            errors.append(
+                ErrorItem(
+                    location="clip.source_end",
+                    index=idx,
+                    code="negative_time",
+                    message=f"第 {idx} 段剪辑 source_end 为负：{clip.source_end}",
+                )
+            )
+        if clip.source_end <= clip.source_start:
+            errors.append(
+                ErrorItem(
+                    location="clip",
+                    index=idx,
+                    code="non_positive_source_duration",
+                    message=(
+                        f"第 {idx} 段剪辑源区间长度非正：source_start="
+                        f"{clip.source_start}，source_end={clip.source_end}，"
+                        "要求 source_end > source_start"
+                    ),
+                )
+            )
+        if clip.duration <= 0:
+            errors.append(
+                ErrorItem(
+                    location="clip.duration",
+                    index=idx,
+                    code="non_positive_duration",
+                    message=f"第 {idx} 段剪辑 duration 非正：{clip.duration}，要求 > 0",
+                )
+            )
+    return errors
+
+
+def project_edit(
+    req: EditProjectRequest,
+) -> tuple[Optional[EditProjectResponse], List[ErrorItem]]:
+    """把每条字幕按半开区间与每段剪辑求交，线性投影到成片时间轴。
+
+    第 j 段剪辑在成片轴上占据 [offset_j, offset_j + duration_j)，其中
+    offset_j 为前面各段 duration 的累计值；源区间可重叠、重排、重复使用。
+    交集端点按 duration / 源区间长度之比精确（分数）线性映射，四舍五入到
+    整数毫秒（半值进位），舍入后零时长的片段丢弃。
+    """
+    errors = validate_project_inputs(req.segments, req.clips)
+    if errors:
+        return None, errors
+
+    results: List[ProjectedSegment] = []
+    used = [False] * len(req.segments)
+
+    offset = 0
+    for clip_idx, clip in enumerate(req.clips):
+        source_len = clip.source_end - clip.source_start
+        scale = Fraction(clip.duration, source_len)
+        for seg_idx, seg in enumerate(req.segments):
+            # 半开区间求交：交集为空当且仅当两侧不相交
+            lo = max(seg.start, clip.source_start)
+            hi = min(seg.end, clip.source_end)
+            if lo >= hi:
+                continue
+
+            # 精确线性映射：成片时间 = 累计起点 + 比例 * (源偏移)
+            start_exact = offset + scale * (lo - clip.source_start)
+            end_exact = offset + scale * (hi - clip.source_start)
+            start_ms = round_half_up(start_exact)
+            end_ms = round_half_up(end_exact)
+            if end_ms <= start_ms:
+                continue
+
+            used[seg_idx] = True
+            results.append(
+                ProjectedSegment(
+                    segment_index=seg_idx,
+                    clip_index=clip_idx,
+                    start=start_ms,
+                    end=end_ms,
+                    text=seg.text,
+                )
+            )
+        offset += clip.duration
+
+    # 按开始、结束、字幕下标、剪辑下标排序
+    results.sort(key=lambda r: (r.start, r.end, r.segment_index, r.clip_index))
+    unused = [i for i, is_used in enumerate(used) if not is_used]
+    return EditProjectResponse(
+        segments=results, unused_segment_indices=unused
+    ), []
+
+
+# --------------------------------------------------------------------------- #
 # FastAPI
 # --------------------------------------------------------------------------- #
 app = FastAPI(
@@ -691,9 +899,11 @@ app = FastAPI(
         "2. ``POST /calibrate``：根据至少两组同步锚点，在相邻锚点间线性换算"
         "字幕片段的起止时间（毫秒）；\n"
         "3. ``POST /layout/wrap``：按显示宽度（全角/宽字符 2 格、其余 1 格）"
-        "为字幕片段做全局最优断行，返回各行文字与断行字符偏移。"
+        "为字幕片段做全局最优断行，返回各行文字与断行字符偏移；\n"
+        "4. ``POST /edits/project``：把源字幕按半开区间投影到剪辑（支持源区间"
+        "重叠、重排、重复使用）后的成片时间轴，输出可直接送入断行接口的片段。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -740,6 +950,20 @@ def layout_wrap_endpoint(req: WrapRequest) -> WrapResponse:
             status_code=422,
             content={
                 "error": "layout_wrap_failed",
+                "detail": [e.model_dump() for e in errors],
+            },
+        )
+    return resp  # type: ignore[return-value]
+
+
+@app.post("/edits/project", response_model=EditProjectResponse)
+def edit_project_endpoint(req: EditProjectRequest) -> EditProjectResponse:
+    resp, errors = project_edit(req)
+    if errors:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "edit_project_failed",
                 "detail": [e.model_dump() for e in errors],
             },
         )

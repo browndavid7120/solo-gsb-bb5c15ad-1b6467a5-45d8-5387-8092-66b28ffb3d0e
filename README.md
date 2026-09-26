@@ -1,10 +1,11 @@
 # 访谈字幕时间轴校准 API
 
-基于 Python + FastAPI 的字幕时间轴校准服务，提供三个接口：
+基于 Python + FastAPI 的字幕时间轴校准服务，提供四个接口：
 
 1. **`POST /anchors/suggest` 锚点推荐**：提交**原片**与**成片**两条按开始时间严格递增的字幕序列，服务端在允许跳过片段的前提下做**全局最优**的文字精确匹配（重复台词、删段均按全局最优处理，而非逐条贪心），返回可直接用于 `/calibrate` 的同步锚点。
 2. **`POST /calibrate` 时间轴校准**：提交以**原录音毫秒**计时的字幕片段，以及至少两组「原时间 → 成片时间」同步锚点；服务端在相邻锚点之间做**分段线性换算**，输出成片时间轴上的字幕起止时间。
 3. **`POST /layout/wrap` 字幕断行**：提交字幕片段与行宽、行数约束，服务端按 **Unicode 码点显示宽度**（东亚全角/宽字符占 2 格、其余占 1 格）为每段做**全局最优**断行，保留原时码与文字，返回每段的各行文字与断行字符偏移。
+4. **`POST /edits/project` 剪辑投影**：提交源字幕片段与按**成片顺序**排列的剪辑清单（源区间允许**重叠、重排、重复使用**），服务端按**半开区间**求每条字幕与每段剪辑的交集，再按 `duration` 与源区间长度之比**线性映射**到剪辑后的成片时间轴，输出可直接送入 `/layout/wrap` 的字幕片段及未产生输出的字幕下标。
 
 ## 功能说明
 
@@ -64,6 +65,33 @@
   - 任一片段在约束下无法排版（`cannot_wrap`）：文字为空、最少行数超过 `max_lines`、单字超宽、或避头尾规则导致无可行断点。
 - `max_width` 非正整数、`max_lines` 超出 1～4、`segments` 为空或缺字段等请求格式错误，返回 `422` 且 `error` 为 `invalid_request`。
 
+### 剪辑投影 `/edits/project`
+
+- 接收两部分输入（时间均为**整数毫秒**）：
+  - `segments[]`：源字幕片段，含 `start`、`end`（半开区间 `[start, end)`）与 `text`；
+  - `clips[]`：按**成片顺序**排列的剪辑，每段含 `source_start`、`source_end`（源素材上的半开区间）与 `duration`（该段在成片时间轴上占据的毫秒数）。
+- 第 `j` 段剪辑在成片轴上的起点是**前面各段 `duration` 的累计值**（与源区间位置无关），因此源区间允许**重叠、重排和重复使用**——同一段源素材可以被放进多次，并以不同 `duration` 做快放/慢放。
+- 投影规则（每条字幕 × 每段剪辑两两计算）：
+  1. 按**半开区间**求交：`lo = max(segment.start, clip.source_start)`，`hi = min(segment.end, clip.source_end)`，`lo >= hi` 视为不相交（端点恰好相接不算命中）；
+  2. 按比例精确线性映射（先用分数计算，避免浮点误差）：
+
+     ```
+     scale = clip.duration / (clip.source_end - clip.source_start)
+     out_start = offset_j + scale * (lo - clip.source_start)
+     out_end   = offset_j + scale * (hi - clip.source_start)
+     ```
+
+  3. 两个端点分别**四舍五入到整数毫秒（半值进位）**；**舍入后时长为零（`end <= start`）的片段丢弃**（例如交集过短、压缩比过大时）。
+- 输出保留原字幕文字，并附带来源下标 `segment_index` / `clip_index`（均从 0 开始），按 **`start`、`end`、`segment_index`、`clip_index` 升序**排序。一条字幕若命中多段剪辑（或同一段源被重复使用），会产生多条输出。
+- 响应中 `unused_segment_indices` 列出**未产生任何输出片段**的字幕下标（升序），包括完全没被任何剪辑覆盖、或所有交集舍入后均为零时长的字幕。
+- `segments[]` 中的每一条都带 `start` / `end` / `text`，可**直接作为 `/layout/wrap` 的 `segments` 输入**（多出的下标字段会被忽略）。
+- 以下情况返回 `422`，错误体中带字段名与下标（所有错误一次性收集）：
+  - `segments` 或 `clips` 为空列表（`code: empty`，位置分别为 `segments` / `clips`）；
+  - 字幕或剪辑起点为负（`negative_time`，位置精确到 `segment.start` / `segment.end` / `clip.source_start` / `clip.source_end`）；
+  - 字幕 `end <= start`（`segment`，`non_positive_duration`）；
+  - 剪辑源区间长度非正（`clip`，`non_positive_source_duration`）或 `duration <= 0`（`clip.duration`，`non_positive_duration`）。
+- 字段缺失、类型不是整数等请求格式错误返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 单条启动命令
 
 无需手动安装依赖，依赖安装与服务启动均已纳入容器启动流程（构建镜像时安装依赖，容器启动时启动服务）：
@@ -103,6 +131,7 @@ docker compose down
 | 锚点推荐接口 | `POST http://localhost:8000/anchors/suggest` |
 | 校准接口 | `POST http://localhost:8000/calibrate` |
 | 字幕断行接口 | `POST http://localhost:8000/layout/wrap` |
+| 剪辑投影接口 | `POST http://localhost:8000/edits/project` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
 
@@ -315,6 +344,97 @@ docker compose down
 
 `max_width` 非正整数、`max_lines` 超出 1～4、`segments` 为空或字段缺失/类型错误时，返回 `422` 且 `error` 为 `invalid_request`。
 
+### 请求 `POST /edits/project`
+
+下例中两段剪辑都取自源区间 `[0, 1000)`（**重复使用 + 重排**由顺序自然支持）：第 1 段 1:1 放入前 1000ms，第 2 段把同一段源慢放到 2000ms（成片 1000～3000ms）。
+
+```json
+{
+  "segments": [
+    { "start": 800, "end": 1200, "text": "跨剪辑的一句话" },
+    { "start": 9000, "end": 9500, "text": "没被任何剪辑采用" }
+  ],
+  "clips": [
+    { "source_start": 0, "source_end": 1000, "duration": 1000 },
+    { "source_start": 0, "source_end": 1000, "duration": 2000 }
+  ]
+}
+```
+
+- `segments[].start` / `segments[].end`：源字幕半开区间，整数毫秒，须非负且 `end > start`。
+- `clips[].source_start` / `source_end`：源素材上的半开区间，整数毫秒，须非负且 `source_end > source_start`；各段之间允许重叠、任意顺序、重复。
+- `clips[].duration`：该段在成片时间轴上的时长，正整数毫秒；第 `j` 段从累计 `duration` 处开始。
+- `segments[].text`：字幕文字，原样保留。
+
+### 成功响应 `200`
+
+字幕 0 的源区间 `[800, 1200)`：与第 1 段剪辑（源 `[0, 1000)`）交在 `[800, 1000)`，1:1 映射到成片 `[800, 1000)`；与第 2 段剪辑（源 `[0, 1000)`、2 倍慢放，成片起点 1000）交在 `[800, 1000)`，映射到成片 `[2600, 3000)`。字幕 1 未命中任何剪辑，进入 `unused_segment_indices`。
+
+```json
+{
+  "segments": [
+    {
+      "segment_index": 0,
+      "clip_index": 0,
+      "start": 800,
+      "end": 1000,
+      "text": "跨剪辑的一句话"
+    },
+    {
+      "segment_index": 0,
+      "clip_index": 1,
+      "start": 2600,
+      "end": 3000,
+      "text": "跨剪辑的一句话"
+    }
+  ],
+  "unused_segment_indices": [1]
+}
+```
+
+`segments[]` 按 `start`、`end`、`segment_index`、`clip_index` 升序排列；取出其中每条的 `start` / `end` / `text` 即可直接送入 `/layout/wrap`。
+
+### 剪辑投影错误响应 `422`
+
+所有错误一次性收集返回，`location` 标明字段，`index` 为出错元素下标（列表为空等整体错误时下标为 `null`）：
+
+```json
+{
+  "error": "edit_project_failed",
+  "detail": [
+    {
+      "location": "segment.start",
+      "index": 0,
+      "code": "negative_time",
+      "message": "第 0 条字幕 start 为负：-1"
+    },
+    {
+      "location": "clip",
+      "index": 1,
+      "code": "non_positive_source_duration",
+      "message": "第 1 段剪辑源区间长度非正：source_start=100，source_end=50，要求 source_end > source_start"
+    },
+    {
+      "location": "clip.duration",
+      "index": 1,
+      "code": "non_positive_duration",
+      "message": "第 1 段剪辑 duration 非正：0，要求 > 0"
+    }
+  ]
+}
+```
+
+错误代码：
+
+| code | 含义 |
+| --- | --- |
+| `empty` | `segments` 或 `clips` 为空列表 |
+| `negative_time` | 字幕/剪辑的起点（`start` / `end` / `source_start` / `source_end`）为负毫秒 |
+| `non_positive_duration` | 字幕 `end <= start`，或剪辑 `duration <= 0` |
+| `non_positive_source_duration` | 剪辑源区间 `source_end <= source_start` |
+
+字段缺失、类型不是整数等请求格式错误返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 调用示例
 
 ### 第一步：`/anchors/suggest` 自动生成锚点
@@ -434,6 +554,37 @@ curl -s -X POST http://localhost:8000/layout/wrap \
 }
 ```
 
+### `/edits/project` 把字幕投影到剪辑后的时间轴
+
+```bash
+curl -s -X POST http://localhost:8000/edits/project \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 800, "end": 1200, "text": "跨剪辑的一句话"},
+      {"start": 9000, "end": 9500, "text": "没被任何剪辑采用"}
+    ],
+    "clips": [
+      {"source_start": 0, "source_end": 1000, "duration": 1000},
+      {"source_start": 0, "source_end": 1000, "duration": 2000}
+    ]
+  }'
+```
+
+响应（第一条字幕被两段剪辑分别命中；第二条未使用）：
+
+```json
+{
+  "segments": [
+    {"segment_index": 0, "clip_index": 0, "start": 800, "end": 1000, "text": "跨剪辑的一句话"},
+    {"segment_index": 0, "clip_index": 1, "start": 2600, "end": 3000, "text": "跨剪辑的一句话"}
+  ],
+  "unused_segment_indices": [1]
+}
+```
+
+把返回的 `segments` 中的 `start` / `end` / `text` 取出，即可继续调用 `/layout/wrap` 断行排版。
+
 ## 本地开发（不用容器）
 
 ```bash
@@ -447,7 +598,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算与字幕断行（全局最优排版）逻辑
+│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算、剪辑投影与字幕断行（全局最优排版）逻辑
 ├── Dockerfile           # 构建期安装依赖，容器启动即启动服务
 ├── docker-compose.yml   # 一键编排
 ├── requirements.txt
