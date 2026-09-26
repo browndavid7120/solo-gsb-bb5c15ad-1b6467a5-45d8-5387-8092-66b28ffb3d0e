@@ -1,10 +1,11 @@
 # 访谈字幕时间轴校准 API
 
-基于 Python + FastAPI 的字幕时间轴校准服务，提供三个接口：
+基于 Python + FastAPI 的字幕时间轴校准服务，提供四个接口：
 
 1. **`POST /anchors/suggest` 锚点推荐**：提交**原片**与**成片**两条按开始时间严格递增的字幕序列，服务端在允许跳过片段的前提下做**全局最优**的文字精确匹配（重复台词、删段均按全局最优处理，而非逐条贪心），返回可直接用于 `/calibrate` 的同步锚点。
 2. **`POST /calibrate` 时间轴校准**：提交以**原录音毫秒**计时的字幕片段，以及至少两组「原时间 → 成片时间」同步锚点；服务端在相邻锚点之间做**分段线性换算**，输出成片时间轴上的字幕起止时间。
 3. **`POST /layout/wrap` 字幕断行**：提交字幕片段与行宽、行数约束，服务端按 **Unicode 码点显示宽度**（东亚全角/宽字符占 2 格、其余占 1 格）为每段做**全局最优**断行，保留原时码与文字，返回每段的各行文字与断行字符偏移。
+4. **`POST /edits/project` 剪辑投影**：提交源字幕 `segments` 与按成片顺序排列的 `clips`（允许源区间**重叠、重排、重复使用**）；服务端按**半开区间**求每条字幕与每段剪辑的交集，再按剪辑时长与源区间长度之比**线性映射**到成片时间轴，四舍五入到毫秒后丢弃零时长片段，返回可直接送入 `/layout/wrap` 的片段及未产生输出的字幕下标。
 
 ## 功能说明
 
@@ -64,6 +65,31 @@
   - 任一片段在约束下无法排版（`cannot_wrap`）：文字为空、最少行数超过 `max_lines`、单字超宽、或避头尾规则导致无可行断点。
 - `max_width` 非正整数、`max_lines` 超出 1～4、`segments` 为空或缺字段等请求格式错误，返回 `422` 且 `error` 为 `invalid_request`。
 
+### 剪辑投影 `/edits/project`
+
+- 接收：
+  - `segments[]`：源字幕，每条含整数毫秒 `start` / `end`（半开区间 `[start, end)`）与 `text`，要求 `start >= 0` 且 `end > start`；
+  - `clips[]`：**按成片顺序排列**的剪辑段，每段含整数毫秒 `source_start` / `source_end`（源时间轴上的半开区间，要求 `source_start >= 0` 且 `source_end > source_start`）与正整数 `duration`（该段在成片中占用的毫秒数）。
+- 各段剪辑**允许源区间重叠、重排与重复使用**：第 `j` 段剪辑（下标即成片顺序）从前面各段 `duration` 的**累计和** `cut_start_j` 处开始，占用成片轴半开区间 `[cut_start_j, cut_start_j + duration_j)`。
+- 对每条字幕与每段剪辑，按半开区间求源时间交集 `[lo, hi) = [start,end) ∩ [source_start,source_end)`；**端点相接不算相交**（`lo >= hi` 时跳过）。交集两端按剪辑速率线性映射到成片轴（精确分数计算）：
+
+  ```
+  final(t) = cut_start_j + duration_j / (source_end_j - source_start_j) * (t - source_start_j)
+  ```
+
+  因此 `duration` 与源区间长度之比即为成片相对源片的速率比：拉伸（duration 更长）或压缩（duration 更短）都由该比值决定；源区间如何重排、复用则完全由 `clips` 的成片顺序决定。
+- 两个端点分别**四舍五入到整数毫秒（0.5 进位）**；舍入后 `end <= start`（零时长或负时长）的片段**直接丢弃**。
+- 成功响应：
+  - `segments[]`：每个投影片段含成片轴整数毫秒 `start` / `end`、原 `text`（原样保留）、来源字幕下标 `segment_index` 与来源剪辑下标 `clip_index`（均从 0 开始）。除两个下标字段外，元素结构与 `/layout/wrap` 的 `segments` 输入一致——把本响应的 `segments` 连同 `max_width` / `max_lines` 直接 `POST` 给 `/layout/wrap` 即可（多余的下标字段会被忽略）。
+  - 片段按 `(start, end, segment_index, clip_index)` **升序**排列。
+  - `unused_segment_indices[]`：**未在任何剪辑中产生有效输出**的源字幕下标（升序）；没有交集、或全部交集都在舍入后被丢弃的字幕都会出现在这里。
+- 以下情况返回 `422`，错误一次性收集，`location` 标明字段、`index` 标明元素下标：
+  - `segments` 或 `clips` 为空列表（`empty`，`index` 为 `null`）；
+  - `segments[].start` 或 `clips[].source_start` 为负（`negative_time`）；
+  - 字幕 `end <= start`、剪辑 `source_end <= source_start`、或剪辑 `duration <= 0`（`non_positive_duration`）。
+
+  缺字段、类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 单条启动命令
 
 无需手动安装依赖，依赖安装与服务启动均已纳入容器启动流程（构建镜像时安装依赖，容器启动时启动服务）：
@@ -103,6 +129,7 @@ docker compose down
 | 锚点推荐接口 | `POST http://localhost:8000/anchors/suggest` |
 | 校准接口 | `POST http://localhost:8000/calibrate` |
 | 字幕断行接口 | `POST http://localhost:8000/layout/wrap` |
+| 剪辑投影接口 | `POST http://localhost:8000/edits/project` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
 
@@ -315,6 +342,115 @@ docker compose down
 
 `max_width` 非正整数、`max_lines` 超出 1～4、`segments` 为空或字段缺失/类型错误时，返回 `422` 且 `error` 为 `invalid_request`。
 
+### 请求 `POST /edits/project`
+
+```json
+{
+  "segments": [
+    { "start": 0, "end": 1000, "text": "片头被剪掉了" },
+    { "start": 1000, "end": 2500, "text": "欢迎来到访谈节目" },
+    { "start": 2500, "end": 4000, "text": "我们开始今天的话题" }
+  ],
+  "clips": [
+    { "source_start": 2500, "source_end": 4000, "duration": 1500 },
+    { "source_start": 1000, "source_end": 2500, "duration": 3000 }
+  ]
+}
+```
+
+- `segments[]`：源字幕；`start` / `end` 为源时间轴上的整数毫秒，半开区间，要求 `start >= 0`、`end > start`；`text` 原样保留（可省略，默认为空字符串）。
+- `clips[]`：**数组顺序即成片顺序**。第 0 段从成片 `0ms` 开始，之后每段从累计 `duration` 处开始。每段：
+  - `source_start` / `source_end`：取用的源半开区间，要求 `source_start >= 0`、`source_end > source_start`；不同剪辑段之间允许**重叠、任意重排、重复使用**同一源区间；
+  - `duration`：该段在成片中占用的毫秒数，正整数；映射速率为 `duration / (source_end - source_start)`。
+- 上例中源时间 `[2500,4000)` 被放到成片最前面，`[1000,2500)` 随后并以 2 倍长度拉伸；源区间 `[0,1000)` 未被任何剪辑使用。
+
+### 成功响应 `200`
+
+```json
+{
+  "segments": [
+    {
+      "start": 0,
+      "end": 1500,
+      "text": "我们开始今天的话题",
+      "segment_index": 2,
+      "clip_index": 0
+    },
+    {
+      "start": 1500,
+      "end": 4500,
+      "text": "欢迎来到访谈节目",
+      "segment_index": 1,
+      "clip_index": 1
+    }
+  ],
+  "unused_segment_indices": [0]
+}
+```
+
+- `segments[]` 按 `(start, end, segment_index, clip_index)` 升序排列；`segment_index` / `clip_index` 为来源下标（从 0 开始）。
+- 一条源字幕若与多段剪辑相交（源区间被重叠/重复使用时），会产生**多条**输出；只有端点相接（半开区间无实际交集）或交集舍入后零时长时不产生输出。
+- 该数组可连同 `max_width` / `max_lines` 直接作为 `/layout/wrap` 的 `segments`，两个下标字段会被忽略。
+- `unused_segment_indices[]` 为未产生任何有效输出的源字幕下标（上例第 0 条完全落在所用源区间之外）。
+
+### 剪辑投影错误响应 `422`
+
+所有校验错误一次性收集返回，`location` 标明字段，`index` 为元素下标（列表本身为空时为 `null`）：
+
+```json
+{
+  "error": "edit_project_failed",
+  "detail": [
+    {
+      "location": "segments",
+      "index": null,
+      "code": "empty",
+      "message": "segments 不能为空"
+    },
+    {
+      "location": "segments.start",
+      "index": 0,
+      "code": "negative_time",
+      "message": "segments 第 0 条 start 为负：-5"
+    },
+    {
+      "location": "segments.end",
+      "index": 1,
+      "code": "non_positive_duration",
+      "message": "segments 第 1 条时长非正：start=100，end=100，要求 end > start"
+    },
+    {
+      "location": "clips.source_start",
+      "index": 0,
+      "code": "negative_time",
+      "message": "clips 第 0 段 source_start 为负：-1"
+    },
+    {
+      "location": "clips.source_end",
+      "index": 1,
+      "code": "non_positive_duration",
+      "message": "clips 第 1 段源区间长度非正：source_start=100，source_end=100，要求 source_end > source_start"
+    },
+    {
+      "location": "clips.duration",
+      "index": 2,
+      "code": "non_positive_duration",
+      "message": "clips 第 2 段 duration 非正：0，要求为正整数"
+    }
+  ]
+}
+```
+
+错误代码：
+
+| code | 含义 |
+| --- | --- |
+| `empty` | `segments` 或 `clips` 为空列表（`location` 指明是哪一个，`index` 为 `null`） |
+| `negative_time` | `segments[].start` 或 `clips[].source_start` 为负毫秒 |
+| `non_positive_duration` | 字幕 `end <= start`、剪辑 `source_end <= source_start`、或剪辑 `duration <= 0` |
+
+字段缺失或类型错误等请求格式问题返回 `422` 且 `error` 为 `invalid_request`。
+
 ## 调用示例
 
 ### 第一步：`/anchors/suggest` 自动生成锚点
@@ -434,6 +570,53 @@ curl -s -X POST http://localhost:8000/layout/wrap \
 }
 ```
 
+### `/edits/project` 把字幕投影到剪辑后的时间轴
+
+剪辑段按数组顺序排列：先放源时间 `[2500,4000)`（时长不变），再放 `[1000,2500)` 并拉伸到 3000ms；源区间 `[0,1000)` 未被采用：
+
+```bash
+curl -s -X POST http://localhost:8000/edits/project \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0, "end": 1000, "text": "片头被剪掉了"},
+      {"start": 1000, "end": 2500, "text": "欢迎来到访谈节目"},
+      {"start": 2500, "end": 4000, "text": "我们开始今天的话题"}
+    ],
+    "clips": [
+      {"source_start": 2500, "source_end": 4000, "duration": 1500},
+      {"source_start": 1000, "source_end": 2500, "duration": 3000}
+    ]
+  }'
+```
+
+响应：
+
+```json
+{
+  "segments": [
+    {"start": 0, "end": 1500, "text": "我们开始今天的话题", "segment_index": 2, "clip_index": 0},
+    {"start": 1500, "end": 4500, "text": "欢迎来到访谈节目", "segment_index": 1, "clip_index": 1}
+  ],
+  "unused_segment_indices": [0]
+}
+```
+
+返回的 `segments` 可以直接送入 `/layout/wrap`（下标字段会被忽略）：
+
+```bash
+curl -s -X POST http://localhost:8000/layout/wrap \
+  -H "Content-Type: application/json" \
+  -d '{
+    "segments": [
+      {"start": 0, "end": 1500, "text": "我们开始今天的话题", "segment_index": 2, "clip_index": 0},
+      {"start": 1500, "end": 4500, "text": "欢迎来到访谈节目", "segment_index": 1, "clip_index": 1}
+    ],
+    "max_width": 8,
+    "max_lines": 2
+  }'
+```
+
 ## 本地开发（不用容器）
 
 ```bash
@@ -447,7 +630,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 .
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算与字幕断行（全局最优排版）逻辑
+│   └── main.py          # FastAPI 应用、锚点推荐（全局最优匹配）、线性换算、字幕断行（全局最优排版）与剪辑投影逻辑
 ├── Dockerfile           # 构建期安装依赖，容器启动即启动服务
 ├── docker-compose.yml   # 一键编排
 ├── requirements.txt
